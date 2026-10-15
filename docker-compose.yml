@@ -1,0 +1,40 @@
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: cokhithaco-mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: "CoKhi_ThaCo_123!"
+      MSSQL_PID: "Developer"
+      TZ: "Asia/Ho_Chi_Minh"
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql_data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'CoKhi_ThaCo_123!' -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cokhithaco-web
+    depends_on:
+      mssql:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Development"
+      ConnectionStrings__DefaultConnection: "Server=mssql,1433;Database=CoKhiThaCoDb;User ID=sa;Password=CoKhi_ThaCo_123!;MultipleActiveResultSets=true;TrustServerCertificate=True;Timeout=300;Connection Timeout=30;ConnectRetryCount=5;ConnectRetryInterval=10;"
+      TZ: "Asia/Ho_Chi_Minh"
+    ports:
+      - "5002:80"
+    volumes:
+      - ./Uploads:/app/Uploads
+    restart: unless-stopped
+
+volumes:
+  mssql_data:
