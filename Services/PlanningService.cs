@@ -32,6 +32,7 @@ namespace CoKhiThaCo.Services
         ICollection<PlanningGroupMachine> GetPlanningGroupMachine(MachineListQuery query, DateTime date);
         List<PlanningDto> BatchUpdateSchedule(BatchUpdateScheduleRequest request);
         List<PlanningDto> BatchSchedule(BatchScheduleRequest request);
+        List<PlanningDto> Swap(SwapPlanningRequest request);
     }
 
     public class PlanningService : IPlanningService
@@ -635,6 +636,138 @@ namespace CoKhiThaCo.Services
             return result;
         }
 
+        public List<PlanningDto> Swap(SwapPlanningRequest request)
+        {
+            if (request == null)
+                throw new Exception("Dữ liệu hoán đổi không được rỗng");
+            if (request.FirstPlanningId == Guid.Empty || request.SecondPlanningId == Guid.Empty)
+                throw new Exception("Phải chọn đủ hai kế hoạch để hoán đổi");
+            if (request.FirstPlanningId == request.SecondPlanningId)
+                throw new Exception("Hai kế hoạch hoán đổi phải khác nhau");
+
+            var planningRepo = _unitOfWork.GetRepository<Planning>();
+            var selectedIds = new[] { request.FirstPlanningId, request.SecondPlanningId };
+            var selected = planningRepo.GetAll(
+                p => selectedIds.Contains(p.Id) && !p.IsDeleted).ToList();
+
+            if (selected.Count != selectedIds.Length)
+                throw new Exception("Một hoặc nhiều kế hoạch không tồn tại");
+
+            var ccfRepo = _unitOfWork.GetRepository<CommandCuttingFile>();
+            var selectedCcfIds = selected.Select(p => p.CommandCuttingFileId).Distinct().ToList();
+            var selectedCcfs = ccfRepo.GetAll(
+                c => selectedCcfIds.Contains(c.Id) && !c.IsDeleted)
+                .ToDictionary(c => c.Id);
+
+            foreach (var planning in selected)
+            {
+                if (planning.Status != PlanningStatus.InProgress)
+                    throw new Exception($"Kế hoạch {planning.Id} không ở trạng thái đang xử lý");
+                if (!planning.MachineId.HasValue)
+                    throw new Exception($"Kế hoạch {planning.Id} chưa được phân công máy");
+                var ccf = selectedCcfs.GetValueOrDefault(planning.CommandCuttingFileId);
+                if (ccf == null)
+                    throw new Exception($"Không tìm thấy lệnh file cắt cho kế hoạch {planning.Id}");
+                if (ccf.CuttingTime <= 0)
+                    throw new Exception($"Thời gian cắt của kế hoạch {planning.Id} không hợp lệ");
+
+                ValidateMachine(ccf.CategoryCuttingFileId, planning.MachineId.Value);
+            }
+
+            var machineId = selected[0].MachineId.Value;
+            if (selected.Any(p => p.MachineId.Value != machineId))
+                throw new Exception("Hai kế hoạch phải thuộc cùng một máy");
+
+            var workingDayStart = GetWorkingDayStartForTime(selected[0].StartTime);
+            var workingDayEnd = workingDayStart.AddDays(1);
+            if (selected.Any(p => GetWorkingDayStartForTime(p.StartTime) != workingDayStart
+                || p.StartTime < workingDayStart
+                || p.EndTime > workingDayEnd
+                || p.EndTime <= p.StartTime))
+            {
+                throw new Exception("Hai kế hoạch phải thuộc cùng một ngày phân bổ hợp lệ");
+            }
+
+            var intervals = GetMachineWorkingDayIntervals(machineId, workingDayStart);
+            if (!intervals.Any())
+                throw new Exception("Máy này không có khoảng thời gian làm việc trong ngày");
+
+            var dayPlannings = planningRepo.GetAll(
+                p => p.MachineId == machineId
+                    && !p.IsDeleted
+                    && p.Status != PlanningStatus.Cancelled
+                    && p.StartTime < workingDayEnd
+                    && p.EndTime > workingDayStart)
+                .OrderBy(p => p.StartTime)
+                .ThenBy(p => p.OrderIndex)
+                .ThenBy(p => p.Id)
+                .ToList();
+
+            var dayCcfIds = dayPlannings
+                .Select(p => p.CommandCuttingFileId)
+                .Distinct()
+                .ToList();
+            var dayCcfs = ccfRepo.GetAll(
+                c => dayCcfIds.Contains(c.Id) && !c.IsDeleted)
+                .ToDictionary(c => c.Id);
+
+            var firstIndex = dayPlannings.FindIndex(p => p.Id == request.FirstPlanningId);
+            var secondIndex = dayPlannings.FindIndex(p => p.Id == request.SecondPlanningId);
+            if (firstIndex < 0 || secondIndex < 0)
+                throw new Exception("Không tìm thấy vị trí phân bổ của kế hoạch");
+
+            var scheduleStartIndex = Math.Min(firstIndex, secondIndex);
+            var affectedPlannings = dayPlannings.Skip(scheduleStartIndex).ToList();
+            var lockedPlanning = affectedPlannings.FirstOrDefault(p =>
+                p.Status != PlanningStatus.InProgress);
+            if (lockedPlanning != null)
+                throw new Exception($"Không thể hoán đổi vì kế hoạch {lockedPlanning.Id} trong vùng bị ảnh hưởng không ở trạng thái đang xử lý");
+
+            var reordered = dayPlannings.ToList();
+            var firstPosition = reordered.FindIndex(p => p.Id == request.FirstPlanningId);
+            var secondPosition = reordered.FindIndex(p => p.Id == request.SecondPlanningId);
+            var item = reordered[firstPosition];
+            reordered[firstPosition] = reordered[secondPosition];
+            reordered[secondPosition] = item;
+
+            var start = AdvanceToWorkingInterval(
+                dayPlannings[scheduleStartIndex].StartTime,
+                intervals);
+            var newSchedule = new List<(Planning Planning, List<PlanningSegment> Segments, DateTime Start, DateTime End, int OrderIndex)>();
+            var orderIndex = scheduleStartIndex + 1;
+
+            foreach (var planning in reordered.Skip(scheduleStartIndex))
+            {
+                var cuttingTime = dayCcfs.GetValueOrDefault(planning.CommandCuttingFileId)?.CuttingTime ?? 0;
+                if (cuttingTime <= 0)
+                    throw new Exception($"Thời gian cắt của kế hoạch {planning.Id} không hợp lệ");
+
+                var segments = GenerateSegments(start, cuttingTime, intervals);
+                newSchedule.Add((
+                    planning,
+                    segments,
+                    segments.First().StartTime,
+                    segments.Last().EndTime,
+                    orderIndex++));
+                if (planning != reordered.Last())
+                    start = AdvanceToWorkingInterval(segments.Last().EndTime, intervals);
+            }
+
+            foreach (var scheduled in newSchedule)
+            {
+                scheduled.Planning.StartTime = scheduled.Start;
+                scheduled.Planning.EndTime = scheduled.End;
+                scheduled.Planning.OrderIndex = scheduled.OrderIndex;
+                scheduled.Planning.UpdatedDate = TimeHelper.Now;
+                planningRepo.Update(scheduled.Planning);
+                SaveSegments(scheduled.Planning.Id, scheduled.Segments);
+            }
+
+            _unitOfWork.Complete();
+
+            return selectedIds.Select(id => GetById(id)).ToList();
+        }
+
         #endregion
 
         #region Helpers
@@ -642,6 +775,14 @@ namespace CoKhiThaCo.Services
         private DateTime GetWorkingDayStart(DateTime date)
         {
             return date.Date + WorkingDayStartTime;
+        }
+
+        private DateTime GetWorkingDayStartForTime(DateTime time)
+        {
+            var date = time.TimeOfDay < WorkingDayStartTime
+                ? time.Date.AddDays(-1)
+                : time.Date;
+            return GetWorkingDayStart(date);
         }
 
         private CommandCuttingFile ValidateCommandCuttingFile(Guid commandCuttingFileId)

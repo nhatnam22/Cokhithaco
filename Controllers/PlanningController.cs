@@ -85,6 +85,21 @@ namespace CoKhiThaCo.Controllers
             }
         }
 
+        [HttpPost("swap")]
+        [RequirePermission("Planning.Update")]
+        public IActionResult Swap([FromBody] SwapPlanningRequest request)
+        {
+            try
+            {
+                var result = _service.Swap(request);
+                return Ok(ApiResponse<List<PlanningDto>>.Ok(result));
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ApiResponse.Fail(ex.Message));
+            }
+        }
+
         [HttpPut("{id}")]
         [RequirePermission("Planning.Update")]
         public IActionResult Update(Guid id, [FromBody] UpdatePlanningRequest request)

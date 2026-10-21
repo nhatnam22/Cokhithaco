@@ -111,4 +111,10 @@ namespace CoKhiThaCo.Models.Dtos.Planning
         public Guid MachineId { get; set; }
         public DateTime Date { get; set; }
     }
+
+    public class SwapPlanningRequest
+    {
+        public Guid FirstPlanningId { get; set; }
+        public Guid SecondPlanningId { get; set; }
+    }
 }
